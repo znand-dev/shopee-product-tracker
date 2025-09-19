@@ -1,154 +1,177 @@
 # src/shopee.py
 import re
-import requests
 import json
+import os
+import requests
+from typing import Tuple, Dict, Optional
 
-def parse_curl_file(file_path="curl.txt"):
+CURL_FILE = os.path.join(os.path.dirname(__file__), "..", "curl.txt")
+ERROR_LOG = os.path.join(os.path.dirname(__file__), "..", "shopee_error.log")
+
+
+def load_headers_and_cookies_from_curl(curl_file: str = CURL_FILE) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Parse curl.txt (should contain full curl command copied from DevTools).
-    Mengembalikan: (curl_url or None, headers dict, cookies dict)
+    Parse a 'curl' string saved in curl.txt into headers and cookies dicts.
+    Works with cURL lines like: -H 'key: value' and -H 'cookie: a=b; c=d'
+    """
+    headers: Dict[str, str] = {}
+    cookies: Dict[str, str] = {}
+
+    if not os.path.isfile(curl_file):
+        return headers, cookies
+
+    text = open(curl_file, "r", encoding="utf-8").read()
+
+    # Find all -H 'Key: value' or --header 'Key: value'
+    for m in re.finditer(r"-H\s+'([^:]+):\s*(.*?)'", text):
+        key = m.group(1).strip()
+        val = m.group(2).strip()
+        if key.lower() == "cookie":
+            # parse cookies
+            for c in val.split(";"):
+                if "=" in c:
+                    k, v = c.strip().split("=", 1)
+                    cookies[k] = v
+        else:
+            headers[key] = val
+
+    # Also try to capture a --cookie "..." or --header "cookie: ..."
+    for m in re.finditer(r"--cookie\s+['\"]?(.*?)['\"]?(?:\s|$)", text):
+        raw = m.group(1).strip()
+        for c in raw.split(";"):
+            if "=" in c:
+                k, v = c.strip().split("=", 1)
+                cookies[k] = v
+
+    return headers, cookies
+
+
+def load_cookies_from_env(env_var="SHOPEE_COOKIE") -> Dict[str, str]:
+    """
+    Fallback: read cookies from environment variable (format: 'a=1; b=2; ...').
+    """
+    raw = os.getenv(env_var, "")
+    cookies = {}
+    if raw:
+        for c in raw.split(";"):
+            if "=" in c:
+                k, v = c.strip().split("=", 1)
+                cookies[k] = v
+    return cookies
+
+
+def log_error(msg: str):
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def fetch_product(shop_id: str, item_id: str, curl_file: str = CURL_FILE) -> Optional[dict]:
+    """
+    Fetch product detail using headers + cookies parsed from curl.txt (or env).
+    Returns a dict with name/stock/price or None if fail.
     """
     try:
-        txt = open(file_path, "r", encoding="utf-8", errors="ignore").read()
-    except FileNotFoundError:
-        return None, {}, {}
+        # Use tz_offset_minutes (correct param)
+        url = (
+            "https://shopee.co.id/api/v4/pdp/get_pc"
+            f"?item_id={item_id}&shop_id={shop_id}&tz_offset_minutes=420&detail_level=0"
+        )
 
-    # ambil URL dari `curl '...url...'` atau curl "url"
-    url_match = re.search(r"curl\s+['\"]([^'\"]+)['\"]", txt)
-    curl_url = url_match.group(1) if url_match else None
+        # Load headers + cookies from curl.txt
+        headers, cookies = load_headers_and_cookies_from_curl(curl_file)
 
-    headers = {}
-    # cari -H 'Header: value' atau -H "Header: value"
-    for m in re.finditer(r"-H\s+['\"]([^:]+):\s*([^'\"]+)['\"]", txt):
-        k = m.group(1).strip()
-        v = m.group(2).strip()
-        # bersihin trailing backslashes dan kutipan sisa
-        v = v.rstrip("\\ ").strip().strip("'\"")
-        headers[k] = v
-
-    # juga support lines yang dimulai dengan two spaces then -H '...'
-    for m in re.finditer(r"\n\s*-H\s+['\"]([^:]+):\s*([^'\"]+)['\"]", txt):
-        k = m.group(1).strip()
-        v = m.group(2).strip()
-        v = v.rstrip("\\ ").strip().strip("'\"")
-        headers[k] = v
-
-    # parse cookies: -b 'a=1; b=2' OR header cookie: 'cookie: a=1; b=2'
-    cookies = {}
-    cookie_match = re.search(r"-b\s+['\"]([^'\"]+)['\"]", txt)
-    if cookie_match:
-        cookie_str = cookie_match.group(1)
-        for part in cookie_str.split(";"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                cookies[k.strip()] = v.strip()
-    else:
-        # check cookie header
-        ck = headers.get("cookie") or headers.get("Cookie")
-        if ck:
-            for part in ck.split(";"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    cookies[k.strip()] = v.strip()
-
-    return curl_url, headers, cookies
-
-
-def get_product_status(item_id: str, shop_id: str, curl_file: str = "curl.txt"):
-    """
-    Fetch product info via pdp/get_pc.
-    Returns dict {name, price, stock} or None.
-    """
-    # allow item_id/shop_id be ints or strings
-    item_id = str(item_id)
-    shop_id = str(shop_id)
-
-    # load headers & cookies from curl.txt if present
-    curl_url, headers, cookies = parse_curl_file(curl_file)
-
-    # fallback minimal headers if none found
-    if not headers:
-        headers = {
+        # Minimal headers if curl.txt not present or missing keys
+        default_headers = {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/114.0.0.0 Safari/537.36",
-            "accept": "application/json, text/plain, */*",
+                          "Chrome/120.0.0.0 Safari/537.36",
+            "referer": f"https://shopee.co.id/product-i.{shop_id}.{item_id}",
+            "x-api-source": "pc",
+            "x-requested-with": "XMLHttpRequest",
+            "if-none-match-": "*",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
         }
+        # merge - prefer values from curl.txt
+        merged_headers = {**default_headers, **headers}
 
-    # ensure referer present and valid
-    if "referer" not in {k.lower(): v for k, v in headers.items()}:
-        # prefer explicit header key 'referer' (case-insensitive)
-        headers["referer"] = f"https://shopee.co.id/product/{shop_id}/{item_id}"
+        # If no cookies parsed from curl.txt try env
+        if not cookies:
+            cookies = load_cookies_from_env()
 
-    # use the canonical URL (we set tz_offset_in_minutes correct)
-    api_url = (
-        "https://shopee.co.id/api/v4/pdp/get_pc"
-        f"?item_id={item_id}&shop_id={shop_id}&tz_offset_in_minutes=420&detail_level=0"
-    )
+        # If still no cookies, leave cookies empty (requests will send none)
+        s = requests.Session()
+        s.headers.update(merged_headers)
+        if cookies:
+            s.cookies.update(cookies)
 
-    # DEBUG prints — ini penting untuk diagnosa
-    print("\n=== DEBUG: Shopee Request ===")
-    print("API URL:", api_url)
-    if curl_url:
-        print("curl.txt URL:", curl_url)
-    print("Headers used (sample):")
-    # print limited headers to avoid leaking huge cookie in console, but show keys
-    for k in list(headers.keys())[:20]:
-        v = headers[k]
-        shortv = v if len(v) < 120 else (v[:110] + "…")
-        print(f"  {k}: {shortv}")
-    if cookies:
-        print("Cookies keys:", list(cookies.keys()))
-    print("=============================\n")
+        print("\n=== DEBUG: Shopee Request ===")
+        print("API URL:", url)
+        print("Headers sample:", list(merged_headers.keys())[:10])
+        print("Cookies keys:", list(s.cookies.keys()))
+        print("=============================\n")
 
-    try:
-        # send request with headers and cookies if any
-        resp = requests.get(api_url, headers=headers, cookies=cookies or None, timeout=15)
-    except Exception as e:
-        print("❌ Request failed:", e)
-        return None
+        # request
+        resp = s.get(url, timeout=15)
+        print("Response status:", resp.status_code)
 
-    # debug status
-    print("Response status:", resp.status_code)
+        if resp.status_code == 403:
+            msg = f"403 Forbidden for item {item_id} shop {shop_id} — cookies/headers likely invalid or blocked."
+            print("❌ Shopee API error: 403")
+            log_error(msg)
+            return None
 
-    # try parse JSON; if fails, print text snippet
-    try:
-        j = resp.json()
-    except Exception:
-        txt = resp.text
-        snippet = txt[:1500] + ("…" if len(txt) > 1500 else "")
-        print("❌ Response is not JSON. Snippet:\n", snippet)
-        return None
+        if resp.status_code != 200:
+            msg = f"HTTP {resp.status_code} for item {item_id} shop {shop_id}"
+            print("❌ Shopee API error:", resp.status_code)
+            log_error(msg)
+            return None
 
-    # if no 'data' field -> print JSON keys & small dump for diagnosis
-    if "data" not in j:
-        small = json.dumps(j, indent=2, ensure_ascii=False)[:3000]
-        print("❌ Invalid response (no data field). JSON head:\n", small)
-        return None
-
-    data = j["data"]
-    # parse price/stock from models or top-level
-    price = None
-    stock = None
-    if data.get("models"):
         try:
-            price = int(data["models"][0].get("price", 0)) // 100000
-            stock = int(data["models"][0].get("stock", 0))
+            data = resp.json()
+        except Exception as e:
+            print("❌ Failed to decode JSON:", e)
+            log_error(f"JSON decode error: {e} | resp_text_snippet: {resp.text[:300]}")
+            return None
+
+        # Normal path
+        if isinstance(data, dict) and "data" in data and data["data"]:
+            pdata = data["data"]
+            return {
+                "name": pdata.get("name", "Unknown"),
+                "stock": pdata.get("stock", "N/A"),
+                "price": pdata.get("price", "N/A"),
+            }
+
+        # explicit Shopee error code handling
+        if isinstance(data, dict) and "error" in data:
+            err = data.get("error")
+            print(f"⚠️ Shopee returned error code: {err}")
+            log_error(f"Item {item_id} Shop {shop_id} returned error {err} | raw_head: {json.dumps(dict(list(data.items())[:8]))}")
+            # return a marker so monitor can store something (optional)
+            return {
+                "name": f"ErrorCode-{err}",
+                "stock": "N/A",
+                "price": "N/A",
+            }
+
+        # Unknown response
+        print("❌ Invalid response (no data field). JSON head:")
+        try:
+            head = json.dumps(dict(list(data.items())[:8]), indent=2)
         except Exception:
-            # fallback safe extraction
-            price = int(data["models"][0].get("price") or 0) // 100000
-            stock = int(data["models"][0].get("stock") or 0)
-    else:
-        price = int(data.get("price", 0)) // 100000 if data.get("price") is not None else 0
-        stock = int(data.get("stock", 0)) if data.get("stock") is not None else 0
+            head = str(data)[:400]
+        print(head)
+        log_error(f"Invalid response for {item_id}@{shop_id} | head: {head}")
+        return None
 
-    name = data.get("name") or data.get("title") or "Unknown"
-
-    result = {
-        "name": name,
-        "price": int(price or 0),
-        "stock": int(stock or 0),
-    }
-
-    print("✅ Parsed product:", result["name"], "| price:", result["price"], "| stock:", result["stock"])
-    return result
+    except Exception as e:
+        print("❌ fetch_product error:", e)
+        log_error(f"Exception fetch_product: {e}")
+        return None

@@ -1,4 +1,4 @@
-from src.shopee import get_product_status
+from src.shopee import fetch_product as get_product_status
 
 class ProductMonitor:
     def __init__(self):
@@ -7,12 +7,16 @@ class ProductMonitor:
     def add_product(self, url: str):
         try:
             # ambil shop_id & item_id dari URL
-            parts = url.split("i.")
-            if len(parts) < 2:
+            if "-i." in url:
+                parts = url.split("-i.")
+            elif "i." in url:
+                parts = url.split("i.")
+            else:
                 print("❌ URL invalid (tidak mengandung i.<shop_id>.<item_id>)")
                 return False, None
 
-            ids = parts[1].split(".")
+            ids_part = parts[1].split("?")[0]  # buang query string
+            ids = ids_part.split(".")
             if len(ids) < 2:
                 print("❌ URL invalid (gagal parsing shop_id & item_id)")
                 return False, None
@@ -20,7 +24,7 @@ class ProductMonitor:
             shop_id, item_id = ids[0], ids[1]
 
             print(f"➡️ Parsed shop_id={shop_id}, item_id={item_id}")
-            data = get_product_status(item_id, shop_id)
+            data = get_product_status(shop_id, item_id)
 
             if not data:
                 print("❌ Gagal fetch Shopee API")
